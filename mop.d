@@ -14,42 +14,40 @@ struct ao_sample_format {
 
 // lifted from sndfile header
 
-const enum SFM_READ = 0x10; // we only every read, so this is the only enum value we need
+// we only every read, so this is the only enum value we need
+const enum SFM_READ = 0x10;
+
 struct SF_INFO {
-    long	    frames ;
-	int			samplerate ;
-	int			channels ;
-	int			format ;
-	int			sections ;
-	int			seekable ;
+    long frames;
+    int samplerate;
+    int channels;
+    int format;
+    int	sections;
+    int	seekable;
 }
 
-enum
-{
-    /* Subtypes from here on. */
+enum {
+    SF_FORMAT_PCM_S8 = 0x0001,
+    SF_FORMAT_PCM_16 = 0x0002,
+    SF_FORMAT_PCM_24 = 0x0003,
+    SF_FORMAT_PCM_32 = 0x0004,
+    SF_FORMAT_PCM_U8 = 0x0005,
 
-	SF_FORMAT_PCM_S8		= 0x0001,		/* Signed 8 bit data */
-	SF_FORMAT_PCM_16		= 0x0002,		/* Signed 16 bit data */
-	SF_FORMAT_PCM_24		= 0x0003,		/* Signed 24 bit data */
-	SF_FORMAT_PCM_32		= 0x0004,		/* Signed 32 bit data */
-
-	SF_FORMAT_PCM_U8		= 0x0005,		/* Unsigned 8 bit data (WAV and RAW only) */
-
-	SF_FORMAT_SUBMASK		= 0x0000FFFF,
+    SF_FORMAT_SUBMASK = 0x0000FFFF,
 };
 
-enum
-{	SF_STR_TITLE		= 0x01,
-	SF_STR_COPYRIGHT	= 0x02,
-	SF_STR_SOFTWARE		= 0x03,
-	SF_STR_ARTIST		= 0x04,
-	SF_STR_COMMENT		= 0x05,
-	SF_STR_DATE		= 0x06,
-	SF_STR_ALBUM		= 0x07,
-	SF_STR_LICENSE		= 0x08,
-	SF_STR_TRACKNUMBER	= 0x09,
-	SF_STR_GENRE		= 0x10
-} ;
+enum {
+    SF_STR_TITLE = 0x01,
+    SF_STR_COPYRIGHT = 0x02,
+    SF_STR_SOFTWARE = 0x03,
+    SF_STR_ARTIST = 0x04,
+    SF_STR_COMMENT = 0x05,
+    SF_STR_DATE = 0x06,
+    SF_STR_ALBUM = 0x07,
+    SF_STR_LICENSE = 0x08,
+    SF_STR_TRACKNUMBER = 0x09,
+    SF_STR_GENRE = 0x10
+};
 
 
 const uint BUFFER_SIZE = 8192;
@@ -76,6 +74,7 @@ import std.algorithm;
 import std.file;
 import std.exception;
 import std.conv;
+import std.typecons;
 import core.time;
 
 ao_device *openDevice(SNDFILE *f, SF_INFO sfinfo, int driver) {
@@ -175,11 +174,8 @@ struct Track {
         uint time;
         float duration;
     }
-
-    bool complete = false;
 };
 
-import std.typecons;
 
 template dumpStruct(T) {
     // dump instantiated struct
@@ -208,12 +204,12 @@ Track makeTrack(string path) {
 
     newTrack.file = path;
     newTrack.last_modified = cast(DateTime) path.timeLastModified;
-    newTrack.artist = fromStringz(sf_get_string(sfdata, SF_STR_ARTIST));
-    newTrack.album = fromStringz(sf_get_string(sfdata, SF_STR_ALBUM));
-    newTrack.title = fromStringz(sf_get_string(sfdata, SF_STR_TITLE));
+    newTrack.artist = fromStringz(sf_get_string(sfdata, SF_STR_ARTIST)).dup;
+    newTrack.album = fromStringz(sf_get_string(sfdata, SF_STR_ALBUM)).dup;
+    newTrack.title = fromStringz(sf_get_string(sfdata, SF_STR_TITLE)).dup;
     newTrack.track = to!uint(fromStringz(sf_get_string(sfdata, SF_STR_TRACKNUMBER)));
-    newTrack.genre = fromStringz(sf_get_string(sfdata, SF_STR_GENRE));
-    newTrack.date = fromStringz(sf_get_string(sfdata, SF_STR_DATE));
+    newTrack.genre = fromStringz(sf_get_string(sfdata, SF_STR_GENRE)).dup;
+    newTrack.date = fromStringz(sf_get_string(sfdata, SF_STR_DATE)).dup;
 
     return newTrack;
 }
@@ -239,10 +235,12 @@ void main() {
         SF_INFO i;
         ao_device *device;
         int pos = 0;
+        bool complete = false;
 
         void init_from_current() {
             file = sf_open(toStringz(current.file), SFM_READ, &i);
             device = openDevice(file, i, driver);
+            complete = false;
         }
 
         void cleanup() {
@@ -272,7 +270,7 @@ void main() {
                             playing = false;
                             break;
                         case PlayerMessage.QUERY_TRACK:
-                            ownerTid.send(current);
+                            ownerTid.send(Tuple!(Track, int)(current, complete ? pos : -1));
                             break;
                         }
                     });
@@ -280,7 +278,7 @@ void main() {
             if(playing && file) {
                 int read = sf_read_short(file, buffer.ptr, BUFFER_SIZE);
                 if(!read) {
-                    current.complete = true;
+                    complete = true;
                     playing = false;
                     cleanup();
                 }
@@ -312,7 +310,8 @@ void main() {
                 break;
             case "currentsong":
                 playerThread.send(PlayerMessage.QUERY_TRACK);
-                dumpStruct!Track(receiveOnly!Track);
+                auto x = receiveOnly!(Tuple!(Track, int));
+                dumpStruct!Track(x[0]);
                 break;
 
             // playback control
@@ -357,32 +356,6 @@ void main() {
             default:
                 throw new Exception("unknown command");
         }
-
-        /*string e = expandTilde(s);
-        immutable(char *) c = toStringz(e);
-        SF_INFO i;
-
-        SNDFILE *file = sf_open(c, SFM_READ, &i);
-        ao_device *device = openDevice(file, i, driver);
-        scope(exit) ao_close(device);
-
-        int pos;
-
-        while(true) {
-            int read = sf_read_short(file, buffer.ptr, BUFFER_SIZE);
-            if(!read) {
-                break;
-            }
-
-            pos += read;
-
-            writeln("position ", pos / i.channels / i.samplerate);
-
-            if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
-                throw new Exception("ao_play failed");
-            }
-        }
-        sf_close(file);*/
     }
     ao_shutdown();
 }
