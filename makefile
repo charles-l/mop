@@ -1,3 +1,3 @@
 mop:  mop.d
-	dmd -debug mop.d -L='-lao' -L='-lsndfile'
+	dmd -g -debug mop.d -L='-lao' -L='-lsndfile'
 

@@ -67,7 +67,7 @@ import std.string;
 import std.range;
 import std.traits;
 import std.path;
-import std.concurrency;
+import std.parallelism;
 import std.stdio;
 import std.datetime.date;
 import std.algorithm;
@@ -75,6 +75,7 @@ import std.file;
 import std.exception;
 import std.conv;
 import std.typecons;
+import core.thread;
 import core.time;
 
 ao_device *openDevice(SNDFILE *f, SF_INFO sfinfo, int driver) {
@@ -105,6 +106,7 @@ ao_device *openDevice(SNDFILE *f, SF_INFO sfinfo, int driver) {
             format.bits = 16;
             break;
     }
+
 
     format.channels = sfinfo.channels;
     format.rate = sfinfo.samplerate;
@@ -156,8 +158,6 @@ struct Stats {
     }
 };
 
-Stats stats;
-
 struct Track {
     @dump {
         string file;
@@ -176,7 +176,6 @@ struct Track {
     }
 };
 
-
 template dumpStruct(T) {
     // dump instantiated struct
     void dumpStruct(T v) {
@@ -191,7 +190,7 @@ void send_error(string msg) {
     writeln("ACK [5@0] {} ", msg);
 }
 
-const string root = "/home/nc/mus/";
+immutable string root = "/home/nc/mus/";
 
 Track makeTrack(string path) {
     Track newTrack;
@@ -215,6 +214,8 @@ Track makeTrack(string path) {
 }
 
 enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
+
+
 void main() {
     writeln("OK MPD 0.20.0");
     ao_initialize();
@@ -222,151 +223,149 @@ void main() {
     assert(driver != -1);
 
     Status status;
+    Stats stats;
 
     Track[] playlist;
+    Track *current;
 
-    auto playerF = (int driver) {
-        short[BUFFER_SIZE * short.sizeof] buffer;
+    // %%%
+    SF_INFO i;
+    SNDFILE *file;
+    ao_device *device;
 
-        bool playing = false;
-        Track current;
+    short[BUFFER_SIZE * short.sizeof] buffer;
 
-        SNDFILE *file;
-        SF_INFO i;
-        ao_device *device;
+    void playTrack() {
         int pos = 0;
-        bool complete = false;
-
-        void init_from_current() {
-            file = sf_open(toStringz(current.file), SFM_READ, &i);
-            device = openDevice(file, i, driver);
-            complete = false;
-        }
-
-        void cleanup() {
-            if(file) {
-                sf_close(file);
-                file = null;
-            }
-            if(device) {
-                ao_close(device);
-                device = null;
-            }
-        }
-
-        void acceptTrack(Track t) {
-            cleanup();
-            current = t;
-            playing = true;
-            init_from_current();
-        }
-
-        void acceptMessage(PlayerMessage m) {
-            final switch(m) {
-                case PlayerMessage.PLAY:
-                    playing = true;
-                    break;
-                case PlayerMessage.PAUSE:
-                    playing = false;
-                    break;
-                case PlayerMessage.QUERY_TRACK:
-                    ownerTid.send(Tuple!(Track, int)(current, complete ? pos : -1));
-                    break;
-            }
-        }
 
         while(true) {
-            receiveTimeout(dur!"nsecs"(-1),
-                    (Track t) { acceptTrack(t); },
-                    (PlayerMessage m) { acceptMessage(m); });
-
-            if(playing && file) {
-                int read = sf_read_short(file, buffer.ptr, BUFFER_SIZE);
-                if(!read) {
-                    complete = true;
-                    playing = false;
-                    cleanup();
-                }
-
-                pos += read;
-
-                current.time = pos / i.channels / i.samplerate;
-
-                if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
-                    throw new Exception("ao_play failed");
-                }
-            } else {
-                // HACK
-                // block until we receive a new message
-                receive(
-                        (Track t) { acceptTrack(t); },
-                        (PlayerMessage m) { acceptMessage(m); });
+            int read = sf_read_short(file, buffer.ptr, BUFFER_SIZE);
+            if(!read) {
+                return;
             }
-        }
-    };
 
-    auto playerThread = spawn(playerF, driver);
+            pos += read;
 
-    while(true) {
-        stats.uptime++;
+            current.time = pos / i.channels / i.samplerate;
 
-        string[] command = chomp(readln).split(" ");
-        switch(command[0]) {
-            // querying
-            case "status":
-                dumpStruct!Status(status);
-                break;
-            case "stats":
-                dumpStruct!Stats(stats);
-                break;
-            case "currentsong":
-                playerThread.send(PlayerMessage.QUERY_TRACK);
-                auto x = receiveOnly!(Tuple!(Track, int));
-                dumpStruct!Track(x[0]);
-                break;
+            if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
+                throw new Exception("ao_play failed");
+            }
 
-            // playback control
-            case "play":
-                uint pos = 0;
-                if(command[1])
-                    pos = to!uint(command[1]);
-                playerThread.send(playlist[pos]);
-
-                break;
-            case "pause":
-                if(to!uint(command[1]))
-                    playerThread.send(PlayerMessage.PAUSE);
-                else
-                    playerThread.send(PlayerMessage.PLAY);
-                break;
-
-            // playlist
-            case "add":
-                string p = root ~ command.drop(1).join(" ");
-
-                char[256] msg;
-                enforce(p.exists, sformat(msg, "no such file or directory: %s", p));
-
-                if(p.isDir) {
-                    foreach(t; p.dirEntries(SpanMode.depth)) {
-                        writeln("adding", t);
-                        try {
-                            playlist ~= makeTrack(t);
-                        } catch(Exception e) {
-                            writeln("failed to add song");
-                        }
-                    }
-                } else {
-                    playlist ~= makeTrack(p);
-                }
-
-                break;
-            case "playlistinfo":
-                playlist.each!(dumpStruct!Track);
-                break;
-            default:
-                throw new Exception("unknown command");
+            Fiber.yield();
         }
     }
+
+    Fiber player;
+
+    bool paused = false;
+
+    void open(Track *t) {
+        file = sf_open(toStringz(t.file), SFM_READ, &i);
+        device = openDevice(file, i, driver);
+        current = t;
+
+        if(player) player.destroy();
+
+        player = new Fiber(&playTrack);
+    }
+
+    // must be called when switching tracks
+    void close() {
+        if(file) {
+            sf_close(file);
+            file = null;
+        }
+
+        if(device) {
+            ao_close(device);
+            device = null;
+        }
+    }
+
+
+    string[] reader() {
+        return chomp(readln).split(" ");
+    }
+    auto getCommand = task(&reader);
+    getCommand.executeInNewThread();
+    while(true) {
+        if(status.state == State.PLAY) {
+            enforce(current);
+            player.call();
+        }
+
+        if(getCommand.done || status.state != State.PLAY) {
+            string[] command = getCommand.yieldForce;
+
+            switch(command[0]) {
+                // querying
+                case "status":
+                    dumpStruct!Status(status);
+                    break;
+                case "stats":
+                    dumpStruct!Stats(stats);
+                    break;
+                case "currentsong":
+                    dumpStruct!Track(*current);
+                    break;
+
+                    // playback control
+                case "play":
+                    close();
+                    uint pos = 0;
+                    if(command[1])
+                        pos = to!uint(command[1]);
+
+                    open(&playlist[pos]);
+                    status.state = State.PLAY;
+
+                    break;
+                case "pause":
+                    if(command.length > 1) {
+                        if(to!uint(command[1]))
+                            status.state = State.PAUSE;
+                        else
+                            status.state = State.PLAY;
+                    } else {
+                        if(status.state == State.PLAY)
+                            status.state = State.PAUSE;
+                        else if(status.state == State.PAUSE)
+                            status.state = State.PLAY;
+                    }
+                    break;
+
+                    // playlist
+                case "add":
+                    string p = root ~ command.drop(1).join(" ");
+
+                    char[256] msg;
+                    enforce(p.exists, sformat(msg, "no such file or directory: %s", p));
+
+                    if(p.isDir) {
+                        foreach(t; p.dirEntries(SpanMode.depth)) {
+                            writeln("adding", t);
+                            try {
+                                playlist ~= makeTrack(t);
+                            } catch(Exception e) {
+                                writeln("failed to add song");
+                            }
+                        }
+                    } else {
+                        playlist ~= makeTrack(p);
+                    }
+
+                    break;
+                case "playlistinfo":
+                    playlist.each!(dumpStruct!Track);
+                    break;
+                default:
+                    throw new Exception("unknown command");
+            }
+            getCommand = task(&reader);
+            getCommand.executeInNewThread();
+        }
+    }
+
     ao_shutdown();
 }
