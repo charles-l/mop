@@ -254,26 +254,31 @@ void main() {
             }
         }
 
+        void acceptTrack(Track t) {
+            cleanup();
+            current = t;
+            playing = true;
+            init_from_current();
+        }
+
+        void acceptMessage(PlayerMessage m) {
+            final switch(m) {
+                case PlayerMessage.PLAY:
+                    playing = true;
+                    break;
+                case PlayerMessage.PAUSE:
+                    playing = false;
+                    break;
+                case PlayerMessage.QUERY_TRACK:
+                    ownerTid.send(Tuple!(Track, int)(current, complete ? pos : -1));
+                    break;
+            }
+        }
+
         while(true) {
             receiveTimeout(dur!"nsecs"(-1),
-                    (Track t) {
-                        cleanup();
-                        current = t;
-                        init_from_current();
-                    },
-                    (PlayerMessage m) {
-                        final switch(m) {
-                        case PlayerMessage.PLAY:
-                            playing = true;
-                            break;
-                        case PlayerMessage.PAUSE:
-                            playing = false;
-                            break;
-                        case PlayerMessage.QUERY_TRACK:
-                            ownerTid.send(Tuple!(Track, int)(current, complete ? pos : -1));
-                            break;
-                        }
-                    });
+                    (Track t) { acceptTrack(t); },
+                    (PlayerMessage m) { acceptMessage(m); });
 
             if(playing && file) {
                 int read = sf_read_short(file, buffer.ptr, BUFFER_SIZE);
@@ -290,6 +295,12 @@ void main() {
                 if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
                     throw new Exception("ao_play failed");
                 }
+            } else {
+                // HACK
+                // block until we receive a new message
+                receive(
+                        (Track t) { acceptTrack(t); },
+                        (PlayerMessage m) { acceptMessage(m); });
             }
         }
     };
