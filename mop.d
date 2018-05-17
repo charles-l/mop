@@ -1,3 +1,5 @@
+import core.stdc.stdint;
+
 struct SNDFILE;
 struct ao_device;
 
@@ -18,7 +20,7 @@ struct ao_sample_format {
 const enum SFM_READ = 0x10;
 
 struct SF_INFO {
-    long frames;
+    int64_t frames;
     int samplerate;
     int channels;
     int format;
@@ -49,11 +51,11 @@ enum {
     SF_STR_GENRE = 0x10
 };
 
-
 const uint BUFFER_SIZE = 8192;
 
 extern (C) void ao_initialize();
-extern (C) SNDFILE *sf_open(const char *f, int, SF_INFO *sfinfo);
+extern (C) SNDFILE *sf_open(const char *, int, SF_INFO *);
+extern (C) int64_t sf_seek(SNDFILE *, int64_t, int);
 extern (C) immutable(char *) sf_get_string(SNDFILE *, int);
 extern (C) int ao_driver_id(const char *);
 extern (C) void ao_shutdown();
@@ -225,6 +227,15 @@ void addToPlaylist(ref Track[] playlist, Track t) {
     playlist ~= t;
 }
 
+uint framesToSeconds(uint frames, SF_INFO i) {
+    return frames / i.channels / i.samplerate;
+}
+
+uint secondsToFrames(uint seconds, SF_INFO i) {
+    return seconds * i.channels * i.samplerate;
+}
+
+
 enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
 
 void main() {
@@ -257,7 +268,7 @@ void main() {
 
             pos += read;
 
-            status.current.time = pos / i.channels / i.samplerate;
+            status.current.time = framesToSeconds(pos, i);
 
             if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
                 throw new Exception("ao_play failed");
@@ -279,8 +290,6 @@ void main() {
     }).executeInNewThread();
 
     Fiber player;
-
-    bool paused = false;
 
     void play(Track *t) {
         // cleanup previous track
@@ -305,6 +314,14 @@ void main() {
         player = new Fiber(&playTrack);
 
         status.state = State.PLAY;
+    }
+
+    void seek(int seconds, bool relative) {
+        if(relative) {
+            sf_seek(file, secondsToFrames(seconds, i), SEEK_CUR);
+        } else {
+            sf_seek(file, secondsToFrames(seconds, i), SEEK_SET);
+        }
     }
 
     string[] reader() {
@@ -333,7 +350,7 @@ void main() {
                         dumpStruct!Track(*status.current);
                         break;
 
-                        // playback control
+                    // playback control
                     case "play":
                         uint pos = 0;
                         if(command[1])
@@ -341,6 +358,23 @@ void main() {
 
                         play(&playlist[pos]);
                         break;
+
+                    case "seek":
+                        uint songpos = to!uint(command[1]);
+                        enforce(&playlist[songpos] == status.current, "unsupported: seeking a song that's not the current one");
+                        seek(to!int(command[1]), false);
+                        break;
+
+                    case "seekid":
+                        uint songid = to!uint(command[1]);
+                        enforce(status.current.id == songid, "unsupported: seeking a song that's not the current one");
+                        seek(to!int(command[1]), false);
+                        break;
+
+                    case "seekcur":
+                        seek(to!int(command[1]), command[1][0] == '-' || command[1][0] == '+');
+                        break;
+
                     case "playid":
                         foreach(track; playlist) {
                             if(track.id == to!uint(command[1])) {
@@ -362,7 +396,6 @@ void main() {
                         if(status.current - 1 >= playlist.ptr)
                             play(status.current - 1);
                         break;
-
                     case "pause":
                         if(command.length > 1) {
                             if(to!uint(command[1]))
@@ -377,7 +410,7 @@ void main() {
                         }
                         break;
 
-                        // playlist
+                    // playlist
                     case "add":
                         string p = root ~ command.drop(1).join(" ");
 
