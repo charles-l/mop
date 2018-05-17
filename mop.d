@@ -123,6 +123,7 @@ const enum State {PLAY, STOP, PAUSE};
 const enum dump = 1; // dump attribute for dumpStruct
 
 struct Status {
+    Track *current;
     @dump {
         uint volume = 100;
         bool repeat = false;
@@ -137,7 +138,12 @@ struct Status {
         uint nextsong;
         uint nextsongid;
         uint time;
-        uint elapsed;
+        @property uint elapsed() {
+            if(current)
+                return current.time;
+            else
+                return 0;
+        };
         uint duration;
         uint bitrate;
         uint xfade;
@@ -173,6 +179,7 @@ struct Track {
         string album_artist = "";
         uint time;
         float duration;
+        uint id;
     }
 };
 
@@ -186,7 +193,7 @@ template dumpStruct(T) {
     }
 }
 
-void send_error(string msg) {
+void sendError(string msg) {
     writeln("ACK [5@0] {} ", msg);
 }
 
@@ -213,8 +220,12 @@ Track makeTrack(string path) {
     return newTrack;
 }
 
-enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
+void addToPlaylist(ref Track[] playlist, Track t) {
+    t.id = cast(uint) playlist.length + 1;
+    playlist ~= t;
+}
 
+enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
 
 void main() {
     writeln("OK MPD 0.20.0");
@@ -224,9 +235,9 @@ void main() {
 
     Status status;
     Stats stats;
+    // TODO scan library and populate artists, albums and tracks
 
     Track[] playlist;
-    Track *current;
 
     // %%%
     SF_INFO i;
@@ -246,7 +257,7 @@ void main() {
 
             pos += read;
 
-            current.time = pos / i.channels / i.samplerate;
+            status.current.time = pos / i.channels / i.samplerate;
 
             if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
                 throw new Exception("ao_play failed");
@@ -256,114 +267,149 @@ void main() {
         }
     }
 
+    task({
+            while(true) {
+                stats.uptime++;
+                if(status.state == State.PLAY) {
+                    stats.playtime++;
+                }
+
+                Thread.sleep(1.seconds);
+            }
+    }).executeInNewThread();
+
     Fiber player;
 
     bool paused = false;
 
-    void open(Track *t) {
+    void play(Track *t) {
+        // cleanup previous track
+        {
+            if(file) {
+                sf_close(file);
+                file = null;
+            }
+
+            if(device) {
+                ao_close(device);
+                device = null;
+            }
+        }
+
         file = sf_open(toStringz(t.file), SFM_READ, &i);
         device = openDevice(file, i, driver);
-        current = t;
+        status.current = t;
 
         if(player) player.destroy();
 
         player = new Fiber(&playTrack);
+
+        status.state = State.PLAY;
     }
-
-    // must be called when switching tracks
-    void close() {
-        if(file) {
-            sf_close(file);
-            file = null;
-        }
-
-        if(device) {
-            ao_close(device);
-            device = null;
-        }
-    }
-
 
     string[] reader() {
         return chomp(readln).split(" ");
     }
+
     auto getCommand = task(&reader);
     getCommand.executeInNewThread();
     while(true) {
-        if(status.state == State.PLAY) {
-            enforce(current);
+        if(status.state == State.PLAY && !getCommand.done) {
+            enforce(status.current);
             player.call();
-        }
+        } else {
+            try {
+                string[] command = getCommand.yieldForce;
 
-        if(getCommand.done || status.state != State.PLAY) {
-            string[] command = getCommand.yieldForce;
+                switch(command[0]) {
+                    // querying
+                    case "status":
+                        dumpStruct!Status(status);
+                        break;
+                    case "stats":
+                        dumpStruct!Stats(stats);
+                        break;
+                    case "currentsong":
+                        dumpStruct!Track(*status.current);
+                        break;
 
-            switch(command[0]) {
-                // querying
-                case "status":
-                    dumpStruct!Status(status);
-                    break;
-                case "stats":
-                    dumpStruct!Stats(stats);
-                    break;
-                case "currentsong":
-                    dumpStruct!Track(*current);
-                    break;
+                        // playback control
+                    case "play":
+                        uint pos = 0;
+                        if(command[1])
+                            pos = to!uint(command[1]);
 
-                    // playback control
-                case "play":
-                    close();
-                    uint pos = 0;
-                    if(command[1])
-                        pos = to!uint(command[1]);
-
-                    open(&playlist[pos]);
-                    status.state = State.PLAY;
-
-                    break;
-                case "pause":
-                    if(command.length > 1) {
-                        if(to!uint(command[1]))
-                            status.state = State.PAUSE;
-                        else
-                            status.state = State.PLAY;
-                    } else {
-                        if(status.state == State.PLAY)
-                            status.state = State.PAUSE;
-                        else if(status.state == State.PAUSE)
-                            status.state = State.PLAY;
-                    }
-                    break;
-
-                    // playlist
-                case "add":
-                    string p = root ~ command.drop(1).join(" ");
-
-                    char[256] msg;
-                    enforce(p.exists, sformat(msg, "no such file or directory: %s", p));
-
-                    if(p.isDir) {
-                        foreach(t; p.dirEntries(SpanMode.depth)) {
-                            writeln("adding", t);
-                            try {
-                                playlist ~= makeTrack(t);
-                            } catch(Exception e) {
-                                writeln("failed to add song");
+                        play(&playlist[pos]);
+                        break;
+                    case "playid":
+                        foreach(track; playlist) {
+                            if(track.id == to!uint(command[1])) {
+                                play(&track);
+                                break;
                             }
                         }
-                    } else {
-                        playlist ~= makeTrack(p);
-                    }
+                        break;
+                    case "stop":
+                        play(&playlist[0]);
+                        status.state = State.STOP;
+                        break;
 
-                    break;
-                case "playlistinfo":
-                    playlist.each!(dumpStruct!Track);
-                    break;
-                default:
-                    throw new Exception("unknown command");
+                    case "next":
+                        if(status.current + 1 < playlist.ptr + (playlist.length * Track.sizeof))
+                            play(status.current + 1);
+                        break;
+                    case "previous":
+                        if(status.current - 1 >= playlist.ptr)
+                            play(status.current - 1);
+                        break;
+
+                    case "pause":
+                        if(command.length > 1) {
+                            if(to!uint(command[1]))
+                                status.state = State.PAUSE;
+                            else
+                                status.state = State.PLAY;
+                        } else {
+                            if(status.state == State.PLAY)
+                                status.state = State.PAUSE;
+                            else if(status.state == State.PAUSE)
+                                status.state = State.PLAY;
+                        }
+                        break;
+
+                        // playlist
+                    case "add":
+                        string p = root ~ command.drop(1).join(" ");
+
+                        char[256] msg;
+                        enforce(p.exists, sformat(msg, "no such file or directory: %s", p));
+
+                        if(p.isDir) {
+                            foreach(t; p.dirEntries(SpanMode.depth)) {
+                                writeln("adding", t);
+                                try {
+                                    playlist.addToPlaylist(makeTrack(t));
+                                } catch(Exception e) {
+                                    writeln("failed to add song");
+                                }
+                            }
+                        } else {
+                            playlist.addToPlaylist(makeTrack(p));
+                        }
+
+                        break;
+                    case "playlistinfo":
+                        playlist.each!(dumpStruct!Track);
+                        break;
+                    default:
+                        throw new Exception("unknown command");
+                }
+            } catch(Exception e) {
+                sendError(e.msg);
+            } finally {
+                getCommand = task(&reader);
+                getCommand.executeInNewThread();
             }
-            getCommand = task(&reader);
-            getCommand.executeInNewThread();
         }
     }
 
