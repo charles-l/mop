@@ -12,6 +12,7 @@ import std.exception;
 import std.conv;
 import std.typecons;
 import std.socket;
+import std.variant;
 import core.thread;
 import core.time;
 
@@ -242,6 +243,9 @@ uint secondsToFrames(uint seconds, SF_INFO i) {
 
 enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
 
+alias Null = typeof(null);
+alias Option(T) = Algebraic!(T, Null);
+
 void main() {
     ao_initialize();
     int driver = ao_driver_id(toStringz("pulse"));
@@ -281,7 +285,7 @@ void main() {
         }
     }
 
-    task({
+    /*task({
             while(true) {
                 stats.uptime++;
                 if(status.state == State.PLAY) {
@@ -290,7 +294,7 @@ void main() {
 
                 Thread.sleep(1.seconds);
             }
-    }).executeInNewThread();
+    }).executeInNewThread();*/
 
     Fiber player;
 
@@ -335,14 +339,32 @@ void main() {
 
     Socket[] clients;
 
+    string[] parseCommand(immutable(string) line) {
+        if(!line.length || line[0] == '\n')
+            return [];
+        if(line[0] == ' ')
+            return parseCommand(line[1..line.length]);
+        if(line[0] == '"') {
+            long n = line[1..line.length].indexOf('"') + 1;
+            writeln("'", line, "' ", n);
+            enforce(n != 0, "unmatched quote in command");
+            return [line[1..n]] ~ parseCommand(line[n+1..line.length]);
+        }
+        long n = line.indexOfAny(" \n");
+        if(n == -1)
+            n = line.length;
+        return line[0..n] ~ parseCommand(line[n..line.length]);
+    }
+
     void handleCommand(Socket c, char[512] input) {
         writeln(format!"input: '%s'"(input));
-        long n = input.text().indexOf('\n');
+        long n = input.indexOf('\n');
         if(n == -1) {
             // malformed, or empty input
             return;
         }
-        string[] command = chomp(text(input[0..indexOf(text(input), '\n')])).split(" ");
+        string[] command = parseCommand(input[0..n+1].text());
+        writeln(command);
         switch(command[0]) {
             // querying
             case "status":
@@ -452,6 +474,7 @@ void main() {
                 c.send("outputenabled: 1\n");
                 break;
 
+            case "command_list_begin":
             case "command_list_ok_begin":
                 char[] s = strip(fromStringz(input.ptr));
                 foreach(l; s.split("\n").drop(1)) {
@@ -467,9 +490,12 @@ void main() {
                         writeln(m);
 
                         handleCommand(c, m);
-                        c.send("list_OK\n");
+                        if(command[0] == "command_list_ok_begin")
+                            c.send("list_OK\n");
                     } catch(Exception e) {
                         c.sendError(e.msg);
+                        if(command[0] == "command_list_begin")
+                            break;
                     }
                 }
                 break;
