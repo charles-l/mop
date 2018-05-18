@@ -4,6 +4,7 @@ import std.range;
 import std.traits;
 import std.path;
 import std.parallelism;
+import std.concurrency;
 import std.stdio;
 import std.datetime.date;
 import std.algorithm;
@@ -12,7 +13,6 @@ import std.exception;
 import std.conv;
 import std.typecons;
 import std.socket;
-import std.variant;
 import core.thread;
 import core.time;
 
@@ -240,11 +240,24 @@ uint secondsToFrames(uint seconds, SF_INFO i) {
     return seconds * i.channels * i.samplerate;
 }
 
-
 enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
 
-alias Null = typeof(null);
-alias Option(T) = Algebraic!(T, Null);
+string[] parseCommand(immutable(string) line) pure {
+    if(!line.length || line[0] == '\n')
+        return [];
+    if(line[0] == ' ')
+        return parseCommand(line[1..line.length]);
+    if(line[0] == '"') {
+        long n = line[1..line.length].indexOf('"') + 1;
+        enforce(n != 0, "unmatched quote in command");
+        return [line[1..n]] ~ parseCommand(line[n+1..line.length]);
+    }
+    long n = line.indexOfAny(" \n");
+    if(n == -1)
+        n = line.length;
+    return line[0..n] ~ parseCommand(line[n..line.length]);
+}
+
 
 void main() {
     ao_initialize();
@@ -285,7 +298,7 @@ void main() {
         }
     }
 
-    /*task({
+    task({
             while(true) {
                 stats.uptime++;
                 if(status.state == State.PLAY) {
@@ -294,7 +307,7 @@ void main() {
 
                 Thread.sleep(1.seconds);
             }
-    }).executeInNewThread();*/
+    }).executeInNewThread();
 
     Fiber player;
 
@@ -334,29 +347,11 @@ void main() {
     Socket socket = new TcpSocket();
     socket.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
     socket.bind(new InternetAddress(6601));
-    socket.listen(1);
-    socket.blocking(false);
+    socket.listen(5);
 
     Socket[] clients;
 
-    string[] parseCommand(immutable(string) line) {
-        if(!line.length || line[0] == '\n')
-            return [];
-        if(line[0] == ' ')
-            return parseCommand(line[1..line.length]);
-        if(line[0] == '"') {
-            long n = line[1..line.length].indexOf('"') + 1;
-            writeln("'", line, "' ", n);
-            enforce(n != 0, "unmatched quote in command");
-            return [line[1..n]] ~ parseCommand(line[n+1..line.length]);
-        }
-        long n = line.indexOfAny(" \n");
-        if(n == -1)
-            n = line.length;
-        return line[0..n] ~ parseCommand(line[n..line.length]);
-    }
-
-    void handleCommand(Socket c, char[512] input) {
+    void handleCommand(Socket c, char[256] input) {
         writeln(format!"input: '%s'"(input));
         long n = input.indexOf('\n');
         if(n == -1) {
@@ -484,7 +479,7 @@ void main() {
                     }
                     try {
                         // XXX this might overflow
-                        char[512] m;
+                        char[input.length] m;
                         m[0..l.length] = l;
                         m[l.length] = '\n';
                         writeln(m);
@@ -504,34 +499,48 @@ void main() {
         }
     }
 
-    while(true) {
-        // accept new connections
-        try {
-            Socket c = socket.accept();
-            c.blocking(false);
-            clients ~= c;
-            c.send("OK MPD 0.20.0\n");
-        } catch(SocketAcceptException e) {
-            // pass
+    static void listenForClients(shared(Socket) serverSocket) {
+        Socket ss = cast(Socket) serverSocket;
+        while(true) {
+            Socket s = ss.accept();
+            ownerTid.send!(shared(Socket))(cast(shared(Socket)) s);
         }
+    }
 
+    static void listenToClient(shared(Socket) c) {
+        Socket s = cast(Socket) c;
+        s.send("OK MPD 0.20.0\n");
+        s.blocking = true;
+        while(true) {
+            char[256] input;
+            if(!s.receive(input))
+                break;
+            ownerTid.send!(shared(Socket), char[256])(c, input);
+        }
+        s.shutdown(SocketShutdown.BOTH);
+        s.close();
+    }
+
+    auto socketGetter = spawn(&listenForClients, cast(shared(Socket)) socket);
+
+    // main loop
+    while(true) {
         if(status.state == State.PLAY) {
             enforce(status.current);
             player.call();
         }
 
-        char[512] input;
-
-        foreach(c; clients) {
-            if(c.receive(input) > 0) {
-                try {
-                    handleCommand(c, input);
-                    c.send("OK\n");
-                } catch(Exception e) {
-                    c.sendError(e.msg);
-                }
-            }
-        }
+        receiveTimeout(-1.seconds,
+                (shared(Socket) c) {spawn(&listenToClient, c);},
+                (shared(Socket) s, char[256] msg) {
+                    Socket c = cast(Socket) s;
+                    try {
+                        handleCommand(c, msg);
+                        c.send("OK\n");
+                    } catch (Exception e) {
+                        c.sendError(e.msg);
+                    }
+                });
     }
 
     ao_shutdown();
