@@ -298,7 +298,7 @@ void main() {
         }
     }
 
-    task({
+    /*task({
             while(true) {
                 stats.uptime++;
                 if(status.state == State.PLAY) {
@@ -307,7 +307,7 @@ void main() {
 
                 Thread.sleep(1.seconds);
             }
-    }).executeInNewThread();
+    }).executeInNewThread();*/
 
     Fiber player;
 
@@ -334,6 +334,11 @@ void main() {
         player = new Fiber(&playTrack);
 
         status.state = State.PLAY;
+    }
+
+    void next() {
+        if(status.current + 1 < playlist.ptr + (playlist.length * Track.sizeof))
+            play(status.current + 1);
     }
 
     void seek(int seconds, bool relative) {
@@ -413,8 +418,7 @@ void main() {
                 break;
 
             case "next":
-                if(status.current + 1 < playlist.ptr + (playlist.length * Track.sizeof))
-                    play(status.current + 1);
+                next();
                 break;
             case "previous":
                 if(status.current - 1 >= playlist.ptr)
@@ -528,6 +532,8 @@ void main() {
         if(status.state == State.PLAY) {
             enforce(status.current);
             player.call();
+            if(player.state == Fiber.State.TERM)
+                next();
         }
 
         receiveTimeout(-1.seconds,
