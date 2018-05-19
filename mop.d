@@ -69,6 +69,24 @@ enum {
     SF_STR_GENRE = 0x10
 };
 
+// lifted from mpd header
+
+enum Ack {
+	ERROR_NOT_LIST = 1,
+	ERROR_ARG = 2,
+	ERROR_PASSWORD = 3,
+	ERROR_PERMISSION = 4,
+	ERROR_UNKNOWN = 5,
+
+	ERROR_NO_EXIST = 50,
+	ERROR_PLAYLIST_MAX = 51,
+	ERROR_SYSTEM = 52,
+	ERROR_PLAYLIST_LOAD = 53,
+	ERROR_UPDATE_ALREADY = 54,
+	ERROR_PLAYER_SYNC = 55,
+	ERROR_EXIST = 56,
+};
+
 const uint BUFFER_SIZE = 8192;
 
 extern (C) void ao_initialize();
@@ -195,13 +213,13 @@ template dumpStruct(T) {
     void dumpStruct(Socket s, T v) {
         static foreach (t; __traits(allMembers, T)) {
             static if ((cast(int[])[__traits(getAttributes, __traits(getMember, T, t))]).canFind(dump))
-                s.send(format!"%s: %s\n"(t, to!string(__traits(getMember, v, t))));
+                s.send(format!"%s: %s\n"(t.capitalize(), to!string(__traits(getMember, v, t))));
         }
     }
 }
 
-void sendError(Socket s, string msg) {
-    s.send(format!"ACK [5@0] {} %s\n"(msg));
+void sendError(Socket s, string msg, uint lineno = 0, Ack ack = Ack.ERROR_UNKNOWN) {
+    s.send(format!"ACK [%u@%u] {} %s\n"(ack, lineno, msg));
 }
 
 immutable string root = "/home/nc/mus/";
@@ -214,6 +232,8 @@ Track makeTrack(string path) {
     scope (exit) sf_close(sfdata);
 
     enforce(sfdata != null, "failed to add file");
+
+    newTrack.duration = framesToSeconds(cast(uint) sf_seek(sfdata, 0, SEEK_END), i);
 
     newTrack.file = path;
     newTrack.last_modified = cast(DateTime) path.timeLastModified;
@@ -357,13 +377,14 @@ void main() {
     Socket[] clients;
 
     void handleCommand(Socket c, char[256] input) {
-        writeln(format!"input: '%s'"(input));
         long n = input.indexOf('\n');
         if(n == -1) {
             // malformed, or empty input
             return;
         }
         string[] command = parseCommand(input[0..n+1].text());
+        if(!command.length)
+            return;
         writeln(command);
         switch(command[0]) {
             // querying
@@ -473,11 +494,25 @@ void main() {
                 c.send("outputenabled: 1\n");
                 break;
 
+            case "decoders":
+                c.send("plugin: sndfile");
+                immutable string[] formats = [
+                    "ogg", "flac", "wav", "aiff", "aifc", "snd", "raw", "paf",
+                    "iff", "svx", "sf", "voc", "w64", "mat4", "mat5", "pvf", "xi",
+                    "htk", "caf", "sd2"
+                ];
+                foreach(f; formats) {
+                    c.send(format!"suffix: %s\n"(formats));
+                }
+                foreach(f; formats) {
+                    c.send(format!"mime_type: audio/%s\n"(formats));
+                }
+                break;
+
             case "command_list_begin":
             case "command_list_ok_begin":
                 char[] s = strip(fromStringz(input.ptr));
-                foreach(l; s.split("\n").drop(1)) {
-                    writeln(format!"handling '%s'"(l));
+                foreach(i, l; s.split("\n").drop(1).enumerate(0)) {
                     if(l == "command_list_end") {
                         break;
                     }
@@ -486,19 +521,19 @@ void main() {
                         char[input.length] m;
                         m[0..l.length] = l;
                         m[l.length] = '\n';
-                        writeln(m);
 
                         handleCommand(c, m);
                         if(command[0] == "command_list_ok_begin")
                             c.send("list_OK\n");
                     } catch(Exception e) {
-                        c.sendError(e.msg);
+                        c.sendError(e.msg, i);
                         if(command[0] == "command_list_begin")
                             break;
                     }
                 }
                 break;
             default:
+                writeln("unknown: ", command);
                 throw new Exception("unknown command");
         }
     }
@@ -536,17 +571,21 @@ void main() {
                 next();
         }
 
-        receiveTimeout(-1.seconds,
-                (shared(Socket) c) {spawn(&listenToClient, c);},
-                (shared(Socket) s, char[256] msg) {
-                    Socket c = cast(Socket) s;
-                    try {
-                        handleCommand(c, msg);
-                        c.send("OK\n");
-                    } catch (Exception e) {
-                        c.sendError(e.msg);
-                    }
-                });
+        auto handlers = tuple((shared(Socket) c) => spawn(&listenToClient, c),
+                              (shared(Socket) s, char[256] msg) {
+                                  Socket c = cast(Socket) s;
+                                  try {
+                                      handleCommand(c, msg);
+                                      c.send("OK\n");
+                                  } catch (Exception e) {
+                                      c.sendError(e.msg);
+                                  }
+                              });
+
+        if(status.state == State.PLAY)
+            receiveTimeout(-1.seconds, handlers[0], handlers[1]);
+        else
+            receive(handlers[0], handlers[1]);
     }
 
     ao_shutdown();
