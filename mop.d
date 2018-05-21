@@ -8,6 +8,7 @@ import std.concurrency;
 import std.stdio;
 import std.datetime.date;
 import std.algorithm;
+import std.algorithm.sorting;
 import std.file;
 import std.exception;
 import std.conv;
@@ -15,6 +16,8 @@ import std.typecons;
 import std.socket;
 import core.thread;
 import core.time;
+import std.random;
+import std.math;
 
 //// FFI ////
 
@@ -144,8 +147,10 @@ ao_device *openDevice(SNDFILE *f, SF_INFO sfinfo, int driver) {
 
 /////
 
-const enum State {PLAY, STOP, PAUSE};
+const enum State {play, stop, pause};
+
 const enum dump = 1; // dump attribute for dumpStruct
+const enum dumpc = 2; // dump attribute capitalized
 
 struct Status {
     Track *current;
@@ -157,19 +162,27 @@ struct Status {
         bool consume = false;
         uint playlist;
         uint playlistlength;
-        State state = State.STOP;
+        State state = State.stop;
         uint song;
         uint songid;
         uint nextsong;
         uint nextsongid;
-        uint time;
-        @property uint elapsed() {
+        @property float elapsed() {
             if(current)
-                return current.time;
+                return current.elapsed;
             else
                 return 0;
         };
-        uint duration;
+        @property string time() {
+            return to!string(round(this.elapsed)) ~ ":" ~ to!string(round(this.duration));
+        }
+
+        @property float duration() {
+            if(current)
+                return current.duration;
+            else
+                return 0;
+        };
         uint bitrate;
         uint xfade;
         float mixrampdb = 0.0;
@@ -190,8 +203,8 @@ struct Stats {
 };
 
 struct Track {
-    @dump {
-        string file;
+    @dump string file;
+    @dumpc {
         DateTime last_modified;
         string artist;
         string album;
@@ -200,12 +213,15 @@ struct Track {
         string genre;
         string date;
         string composer = "";
-        uint disc = 0;
+        uint disc = 1;
         string album_artist = "";
-        uint time;
-        float duration;
-        uint id;
+        @property uint time() {
+            return cast(uint) round(this.duration);
+        }
     }
+    @dump float duration;
+    @dumpc uint id;
+    float elapsed = 0;
 };
 
 template dumpStruct(T) {
@@ -213,7 +229,9 @@ template dumpStruct(T) {
     void dumpStruct(Socket s, T v) {
         static foreach (t; __traits(allMembers, T)) {
             static if ((cast(int[])[__traits(getAttributes, __traits(getMember, T, t))]).canFind(dump))
-                s.send(format!"%s: %s\n"(t.capitalize(), to!string(__traits(getMember, v, t))));
+                s.send(format!"%s: %s\n"(t, to!string(__traits(getMember, v, t))));
+            static if ((cast(int[])[__traits(getAttributes, __traits(getMember, T, t))]).canFind(dumpc))
+                s.send(format!"%s: %s\n"(t.tr("_", "-").capitalize(), to!string(__traits(getMember, v, t))));
         }
     }
 }
@@ -252,11 +270,11 @@ void addToPlaylist(ref Track[] playlist, Track t) {
     playlist ~= t;
 }
 
-uint framesToSeconds(uint frames, SF_INFO i) {
-    return frames / i.channels / i.samplerate;
+float framesToSeconds(uint frames, SF_INFO i) {
+    return cast(float) frames / i.channels / i.samplerate;
 }
 
-uint secondsToFrames(uint seconds, SF_INFO i) {
+float secondsToFrames(float seconds, SF_INFO i) {
     return seconds * i.channels * i.samplerate;
 }
 
@@ -288,7 +306,7 @@ void main() {
     Stats stats;
     // TODO scan library and populate artists, albums and tracks
 
-    Track[] playlist;
+    Track[] queue;
 
     // %%%
     SF_INFO i;
@@ -308,7 +326,7 @@ void main() {
 
             pos += read;
 
-            status.current.time = framesToSeconds(pos, i);
+            status.current.elapsed = framesToSeconds(pos, i);
 
             if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
                 throw new Exception("ao_play failed");
@@ -353,19 +371,19 @@ void main() {
 
         player = new Fiber(&playTrack);
 
-        status.state = State.PLAY;
+        status.state = State.play;
     }
 
     void next() {
-        if(status.current + 1 < playlist.ptr + (playlist.length * Track.sizeof))
+        if(status.current + 1 < queue.ptr + (queue.length * Track.sizeof))
             play(status.current + 1);
     }
 
     void seek(int seconds, bool relative) {
         if(relative) {
-            sf_seek(file, secondsToFrames(seconds, i), SEEK_CUR);
+            sf_seek(file, cast(int64_t) secondsToFrames(seconds, i), SEEK_CUR);
         } else {
-            sf_seek(file, secondsToFrames(seconds, i), SEEK_SET);
+            sf_seek(file, cast(int64_t) secondsToFrames(seconds, i), SEEK_SET);
         }
     }
 
@@ -405,13 +423,13 @@ void main() {
                 if(command.length > 1)
                     pos = to!uint(command[1]);
 
-                if(playlist.length > 1)
-                    play(&playlist[pos]);
+                if(queue.length > 1)
+                    play(&queue[pos]);
                 break;
 
             case "seek":
                 uint songpos = to!uint(command[1]);
-                enforce(&playlist[songpos] == status.current, "unsupported: seeking a song that's not the current one");
+                enforce(&queue[songpos] == status.current, "unsupported: seeking a song that's not the current one");
                 seek(to!int(command[1]), false);
                 break;
 
@@ -426,7 +444,7 @@ void main() {
                 break;
 
             case "playid":
-                foreach(track; playlist) {
+                foreach(track; queue) {
                     if(track.id == to!uint(command[1])) {
                         play(&track);
                         break;
@@ -434,28 +452,28 @@ void main() {
                 }
                 break;
             case "stop":
-                play(&playlist[0]);
-                status.state = State.STOP;
+                play(&queue[0]);
+                status.state = State.stop;
                 break;
 
             case "next":
                 next();
                 break;
             case "previous":
-                if(status.current - 1 >= playlist.ptr)
+                if(status.current - 1 >= queue.ptr)
                     play(status.current - 1);
                 break;
             case "pause":
                 if(command.length > 1) {
                     if(to!uint(command[1]))
-                        status.state = State.PAUSE;
+                        status.state = State.pause;
                     else
-                        status.state = State.PLAY;
+                        status.state = State.play;
                 } else {
-                    if(status.state == State.PLAY)
-                        status.state = State.PAUSE;
-                    else if(status.state == State.PAUSE)
-                        status.state = State.PLAY;
+                    if(status.state == State.play)
+                        status.state = State.pause;
+                    else if(status.state == State.pause)
+                        status.state = State.play;
                 }
                 break;
 
@@ -470,22 +488,33 @@ void main() {
                     foreach(t; p.dirEntries(SpanMode.depth)) {
                         writeln("adding", t);
                         try {
-                            playlist.addToPlaylist(makeTrack(t));
+                            queue.addToPlaylist(makeTrack(t));
                         } catch(Exception e) {
                             writeln("failed to add song");
                         }
                     }
                 } else {
-                    playlist.addToPlaylist(makeTrack(p));
+                    queue.addToPlaylist(makeTrack(p));
                 }
 
                 break;
             case "playlistinfo":
-                playlist.each!(a => c.dumpStruct!Track(a));
+                queue.each!(a => c.dumpStruct!Track(a));
                 break;
 
+            case "shuffle":
+                bool shouldShuffle = false;
+                if(command.length == 1 || (command.length > 1 && command[1] == "1"))
+                    shouldShuffle = true;
+                if(shouldShuffle)
+                    queue.randomShuffle();
+                else
+                    queue.sort!("a.id < b.id");
+                break;
+
+            // other
             case "plchanges":
-                playlist.each!(a => c.dumpStruct!Track(a));
+                queue.each!(a => c.dumpStruct!Track(a));
                 break;
 
             case "outputs":
@@ -564,7 +593,7 @@ void main() {
 
     // main loop
     while(true) {
-        if(status.state == State.PLAY) {
+        if(status.state == State.play) {
             enforce(status.current);
             player.call();
             if(player.state == Fiber.State.TERM)
@@ -582,7 +611,7 @@ void main() {
                                   }
                               });
 
-        if(status.state == State.PLAY)
+        if(status.state == State.play)
             receiveTimeout(-1.seconds, handlers[0], handlers[1]);
         else
             receive(handlers[0], handlers[1]);
