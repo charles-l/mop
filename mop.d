@@ -90,56 +90,21 @@ enum Ack {
 	ERROR_EXIST = 56,
 };
 
-const uint BUFFER_SIZE = 8192;
-
 extern (C) void ao_initialize();
 extern (C) SNDFILE *sf_open(const char *, int, SF_INFO *);
 extern (C) int64_t sf_seek(SNDFILE *, int64_t, int);
 extern (C) immutable(char *) sf_get_string(SNDFILE *, int);
 extern (C) int ao_driver_id(const char *);
 extern (C) void ao_shutdown();
-extern (C) int sf_read_short(SNDFILE *, short *buf, size_t);
+extern (C) int sf_readf_short(SNDFILE *, short *buf, size_t);
 extern (C) int ao_play(ao_device *, char *, uint);
 extern (C) void ao_close(ao_device *);
 extern (C) ao_device *ao_open_live(int, ao_sample_format *, void *);
 extern (C) void sf_close(SNDFILE *);
 
-ao_device *openDevice(SNDFILE *f, SF_INFO sfinfo, int driver) {
+ao_device *openDevice(TrackMeta m, int driver) {
     ao_device *device;
-    ao_sample_format format;
-
-    printf("Samples: %d\n", sfinfo.frames);
-    printf("Sample rate: %d\n", sfinfo.samplerate);
-    printf("Channels: %d\n", sfinfo.channels);
-
-    switch (sfinfo.format & SF_FORMAT_SUBMASK) {
-        case SF_FORMAT_PCM_16:
-            format.bits = 16;
-            break;
-        case SF_FORMAT_PCM_24:
-            format.bits = 24;
-            break;
-        case SF_FORMAT_PCM_32:
-            format.bits = 32;
-            break;
-        case SF_FORMAT_PCM_S8:
-            format.bits = 8;
-            break;
-        case SF_FORMAT_PCM_U8:
-            format.bits = 8;
-            break;
-        default:
-            format.bits = 16;
-            break;
-    }
-
-
-    format.channels = sfinfo.channels;
-    format.rate = sfinfo.samplerate;
-    format.byte_format = AO_FMT_NATIVE;
-    format.matrix = null;
-
-    device = ao_open_live(driver, &format, null);
+    device = ao_open_live(driver, &m.format, null);
 
     enforce(device != null, "error opening device");
     return device;
@@ -153,7 +118,8 @@ const enum dump = 1; // dump attribute for dumpStruct
 const enum dumpc = 2; // dump attribute capitalized
 
 struct Status {
-    Track *current;
+    Track *track;
+    int current = -1;
     @dump {
         uint volume = 100;
         bool repeat = false;
@@ -168,8 +134,8 @@ struct Status {
         uint nextsong;
         uint nextsongid;
         @property float elapsed() {
-            if(current)
-                return current.elapsed;
+            if(track)
+                return track.elapsed;
             else
                 return 0;
         };
@@ -178,8 +144,8 @@ struct Status {
         }
 
         @property float duration() {
-            if(current)
-                return current.duration;
+            if(track)
+                return track.duration;
             else
                 return 0;
         };
@@ -202,7 +168,7 @@ struct Stats {
     }
 };
 
-struct Track {
+struct TrackMeta {
     @dump string file;
     @dumpc {
         DateTime last_modified;
@@ -222,7 +188,271 @@ struct Track {
     @dump float duration;
     @dumpc uint id;
     float elapsed = 0;
+
+    // low level metadata information
+    size_t framesize; // framesize in bytes
+    ssize_t nframes = 32; // number of frames to grab at once
+    ao_sample_format format;
 };
+
+// lifted from libmpg123
+extern (C) void mpg123_init();
+extern (C) void mpg123_exit();
+extern struct mpg123_handle;
+extern (C) mpg123_handle *mpg123_new(void *, int *);
+extern (C) size_t mpg123_outblock(mpg123_handle *);
+extern (C) void mpg123_open(mpg123_handle *, const char *);
+extern (C) void mpg123_getformat(mpg123_handle *, long *, int *, int *);
+extern (C) int mpg123_read(mpg123_handle *, char *, size_t, size_t *);
+extern (C) int mpg123_encsize(int);
+extern (C) int mpg123_seek(mpg123_handle *, int, int);
+extern (C) int mpg123_id3(mpg123_handle *, mpg123_id3v1 **, mpg123_id3v2**);
+extern (C) int mpg123_info(mpg123_handle *, mpg123_frameinfo *);
+extern (C) void mpg123_close(mpg123_handle *);
+extern (C) void mpg123_delete(mpg123_handle *);
+
+struct mpg123_string {
+        char* p;
+        size_t size;
+        size_t fill;
+};
+
+struct mpg123_text;
+struct mpg123_picture;
+
+struct mpg123_id3v1 {
+        char[3] tag;         /**< Always the string "TAG", the classic intro. */
+        char[30] title;      /**< Title string.  */
+        char[30] artist;     /**< Artist string. */
+        char[30] album;      /**< Album string. */
+        char[4] year;        /**< Year string. */
+        char[30] comment;    /**< Comment string. */
+        char genre; /**< Genre index. */
+};
+
+struct mpg123_id3v2 {
+        char ver;
+        mpg123_string *title;
+        mpg123_string *artist;
+        mpg123_string *album;
+        mpg123_string *year;
+        mpg123_string *genre;
+        mpg123_string *comment;
+        mpg123_text    *comment_list; /**< Array of comments. */
+        size_t          comments;     /**< Number of comments. */
+        mpg123_text    *text;         /**< Array of ID3v2 text fields (including USLT) */
+        size_t          texts;        /**< Numer of text fields. */
+        mpg123_text    *extra;        /**< The array of extra (TXXX) fields. */
+        size_t          extras;       /**< Number of extra text (TXXX) fields. */
+        mpg123_picture  *picture;     /**< Array of ID3v2 pictures fields (APIC). */
+        size_t           pictures;    /**< Number of picture (APIC) fields. */
+};
+
+struct mpg123_frameinfo {
+	uint ver;	/**< The MPEG version (1.0/2.0/2.5). */
+	int layer;						/**< The MPEG Audio Layer (MP1/MP2/MP3). */
+	long rate; 						/**< The sampling rate in Hz. */
+	uint mode;			/**< The audio mode (Mono, Stereo, Joint-stero, Dual Channel). */
+	int mode_ext;					/**< The mode extension bit flag. */
+	int framesize;					/**< The size of the frame (in bytes, including header). */
+	uint flags;		/**< MPEG Audio flag bits. Just now I realize that it should be declared as int, not enum. It's a bitwise combination of the enum values. */
+	int emphasis;					/**< The emphasis type. */
+	int bitrate;					/**< Bitrate of the frame (kbps). */
+	int abr_rate;					/**< The target average bitrate. */
+	uint vbr;			/**< The VBR mode. */
+};
+
+const enum MPG123_OK = 0;
+
+struct MpegTrack {
+    static extensions = [".mpeg", ".mp3"];
+    TrackMeta meta;
+    mpg123_handle *mh;
+
+    alias meta this;
+}
+
+struct SndfileTrack {
+    static extensions = [".flac", ".ogg"];
+    TrackMeta meta;
+    SNDFILE *sfile;
+
+    alias meta this;
+}
+
+struct Track {
+    static enum Type {MpegTrack, SndfileTrack};
+    Type type;
+    union U {
+        TrackMeta meta;
+        SndfileTrack sndfile;
+        MpegTrack mpeg;
+        alias meta this;
+    };
+    U u;
+    alias u this;
+}
+
+Track open(string path) {
+    Track r;
+    if(MpegTrack.extensions.canFind(path.extension)) {
+        const int bits = 8;
+
+        MpegTrack t;
+
+        int err;
+        t.mh = mpg123_new(null, &err);
+        enforce(t.mh, format!"failed to obtain mpg123 handle. Error: %d"(err));
+
+        mpg123_open(t.mh, toStringz(path));
+
+        mpg123_frameinfo i;
+        enforce(mpg123_info(t.mh, &i) == MPG123_OK);
+
+        t.framesize = i.framesize;
+
+        long rate;
+        int channels, encoding;
+        mpg123_getformat(t.mh, &rate, &channels, &encoding);
+
+        // format
+        t.format.bits = mpg123_encsize(encoding) * bits;
+        t.format.rate = cast(int) rate;
+        t.format.channels = channels;
+        t.format.byte_format = AO_FMT_NATIVE;
+        t.format.matrix = null;
+
+        // meta
+        mpg123_id3v1 *v1;
+        mpg123_id3v2 *v2;
+
+        if(v1 && v2) {
+            mpg123_id3(t.mh, &v1, &v2);
+
+            t.artist = fromStringz(v1.artist.ptr).dup;
+            t.album = fromStringz(v1.album.ptr).dup;
+            t.title = fromStringz(v1.title.ptr).dup;
+
+            // apparently comment[29] is the track number in id3v1.1
+            t.track = to!uint(v1.comment[29]);
+            //track.genre = fromStringz(...).dup;
+            t.date = v1.year[0..4].dup;
+        }
+
+        r.type = Track.Type.MpegTrack;
+        r.mpeg = t;
+    } else if (SndfileTrack.extensions.canFind(path.extension)) {
+        SndfileTrack t;
+
+        SF_INFO info;
+        t.sfile = sf_open(toStringz(path), SFM_READ, &info);
+        enforce(t.sfile != null, format!"failed to read file %s"(path));
+
+        // format
+        switch (info.format & SF_FORMAT_SUBMASK) {
+            case SF_FORMAT_PCM_16:
+                t.format.bits = 16;
+                break;
+            case SF_FORMAT_PCM_24:
+                t.format.bits = 24;
+                break;
+            case SF_FORMAT_PCM_32:
+                t.format.bits = 32;
+                break;
+            case SF_FORMAT_PCM_S8:
+                t.format.bits = 8;
+                break;
+            case SF_FORMAT_PCM_U8:
+                t.format.bits = 8;
+                break;
+            default:
+                t.format.bits = 16;
+                break;
+        }
+
+        t.format.channels = info.channels;
+        t.format.rate = info.samplerate;
+        t.format.byte_format = AO_FMT_NATIVE;
+        t.format.matrix = null;
+
+        t.framesize = 2;
+
+        // meta
+        t.artist = fromStringz(sf_get_string(t.sfile, SF_STR_ARTIST)).dup;
+        t.album = fromStringz(sf_get_string(t.sfile, SF_STR_ALBUM)).dup;
+        t.title = fromStringz(sf_get_string(t.sfile, SF_STR_TITLE)).dup;
+        t.track = to!uint(fromStringz(sf_get_string(t.sfile, SF_STR_TRACKNUMBER)));
+        t.genre = fromStringz(sf_get_string(t.sfile, SF_STR_GENRE)).dup;
+        t.date = fromStringz(sf_get_string(t.sfile, SF_STR_DATE)).dup;
+
+        r.type = Track.Type.SndfileTrack;
+        r.sndfile = t;
+    } else {
+        throw new Exception(format!"unknown extension for %s"(path));
+    }
+
+    // shared meta
+    r.file = path;
+    r.duration = r.seek(0, SEEK_END);
+    r.seek(0, SEEK_SET);
+    r.last_modified = cast(DateTime) path.timeLastModified;
+
+    enforce(r.framesize, "must set a framesize for every format");
+    return r;
+}
+
+void close(Track t) {
+    final switch(t.type) {
+        case Track.Type.MpegTrack:
+            mpg123_close(t.mpeg.mh);
+            break;
+        case Track.Type.SndfileTrack:
+            sf_close(t.sndfile.sfile);
+            break;
+    }
+}
+
+float seek(ref Track t, float seconds, int whence) {
+    t.elapsed = seconds;
+    final switch(t.type) {
+        case Track.Type.MpegTrack:
+            return t.framesToSeconds(mpg123_seek(t.mpeg.mh, t.secondsToOffset(seconds), whence));
+        case Track.Type.SndfileTrack:
+            return t.framesToSeconds(cast(uint) sf_seek(t.sndfile.sfile, t.secondsToOffset(seconds), whence));
+    }
+}
+
+// returns seconds played
+float playChunk(ao_device *device, Track t) {
+    char[] buf = new char[t.framesize * t.nframes];
+    int frames;
+    size_t bytesRead;
+
+    final switch(t.type) {
+        case Track.Type.MpegTrack:
+            int err = mpg123_read(t.mpeg.mh, buf.ptr, buf.length, &bytesRead);
+            frames = cast(int) (bytesRead / t.framesize / t.format.channels);
+            enforce(err == MPG123_OK, format!"failed to read mp3: got error code %d"(err));
+            break;
+        case Track.Type.SndfileTrack:
+            frames = sf_readf_short(t.sndfile.sfile, cast(short *) buf.ptr, t.nframes);
+            bytesRead = cast(size_t) frames * t.framesize * t.format.channels;
+            break;
+    }
+
+    float seconds = t.framesToSeconds(frames);
+
+    if(bytesRead == 0) return 0;
+
+    ao_play(device, buf.ptr, cast(uint) bytesRead);
+    return seconds;
+}
+
+TrackMeta openMeta(string path) {
+    Track t = open(path);
+    scope(exit) t.close();
+    return t.meta;
+}
 
 template dumpStruct(T) {
     // dump instantiated struct
@@ -242,43 +472,18 @@ void sendError(Socket s, string msg, uint lineno = 0, Ack ack = Ack.ERROR_UNKNOW
 
 immutable string root = "/home/nc/mus/";
 
-Track makeTrack(string path) {
-    Track newTrack;
-
-    SF_INFO i;
-    SNDFILE *sfdata = sf_open(toStringz(path), SFM_READ, &i);
-    scope (exit) sf_close(sfdata);
-
-    enforce(sfdata != null, "failed to add file");
-
-    newTrack.duration = framesToSeconds(cast(uint) sf_seek(sfdata, 0, SEEK_END), i);
-
-    newTrack.file = path;
-    newTrack.last_modified = cast(DateTime) path.timeLastModified;
-    newTrack.artist = fromStringz(sf_get_string(sfdata, SF_STR_ARTIST)).dup;
-    newTrack.album = fromStringz(sf_get_string(sfdata, SF_STR_ALBUM)).dup;
-    newTrack.title = fromStringz(sf_get_string(sfdata, SF_STR_TITLE)).dup;
-    newTrack.track = to!uint(fromStringz(sf_get_string(sfdata, SF_STR_TRACKNUMBER)));
-    newTrack.genre = fromStringz(sf_get_string(sfdata, SF_STR_GENRE)).dup;
-    newTrack.date = fromStringz(sf_get_string(sfdata, SF_STR_DATE)).dup;
-
-    return newTrack;
-}
-
-void addToPlaylist(ref Track[] playlist, Track t) {
+void addToPlaylist(ref TrackMeta[] playlist, TrackMeta t) {
     t.id = cast(uint) playlist.length + 1;
     playlist ~= t;
 }
 
-float framesToSeconds(uint frames, SF_INFO i) {
-    return cast(float) frames / i.channels / i.samplerate;
+float framesToSeconds(TrackMeta m, uint frames) {
+    return cast(float) frames / m.format.rate;
 }
 
-float secondsToFrames(float seconds, SF_INFO i) {
-    return seconds * i.channels * i.samplerate;
+uint secondsToOffset(TrackMeta m, float seconds) {
+    return cast(uint) (seconds * m.format.channels * m.format.rate * m.framesize);
 }
-
-enum PlayerMessage {QUERY_TRACK, PLAY, PAUSE};
 
 string[] parseCommand(immutable(string) line) pure {
     if(!line.length || line[0] == '\n')
@@ -298,43 +503,26 @@ string[] parseCommand(immutable(string) line) pure {
 
 
 void main() {
+    // libao for output
     ao_initialize();
+    scope(exit) ao_shutdown();
+
+    // init libmpg123
+    mpg123_init();
+    scope(exit) mpg123_exit();
+
     int driver = ao_driver_id(toStringz("pulse"));
     assert(driver != -1);
 
     Status status;
     Stats stats;
+
     // TODO scan library and populate artists, albums and tracks
 
-    Track[] queue;
+    TrackMeta[] queue;
 
     // %%%
-    SF_INFO i;
-    SNDFILE *file;
     ao_device *device;
-
-    short[BUFFER_SIZE * short.sizeof] buffer;
-
-    void playTrack() {
-        int pos = 0;
-
-        while(true) {
-            int read = sf_read_short(file, buffer.ptr, BUFFER_SIZE);
-            if(!read) {
-                return;
-            }
-
-            pos += read;
-
-            status.current.elapsed = framesToSeconds(pos, i);
-
-            if(ao_play(device, cast(char *) buffer.ptr, cast(uint) (read * short.sizeof)) == 0) {
-                throw new Exception("ao_play failed");
-            }
-
-            Fiber.yield();
-        }
-    }
 
     /*task({
             while(true) {
@@ -349,12 +537,14 @@ void main() {
 
     Fiber player;
 
-    void play(Track *t) {
+    void play(uint i) {
+        status.current = i;
+
         // cleanup previous track
         {
-            if(file) {
-                sf_close(file);
-                file = null;
+            if(status.track) {
+                status.track.destroy();
+                status.track = null;
             }
 
             if(device) {
@@ -363,28 +553,27 @@ void main() {
             }
         }
 
-        file = sf_open(toStringz(t.file), SFM_READ, &i);
-        device = openDevice(file, i, driver);
-        status.current = t;
+        status.track = new Track;
+        *status.track = open(queue[i].file);
+
+        device = openDevice(queue[i], driver);
 
         if(player) player.destroy();
 
-        player = new Fiber(&playTrack);
+        player = new Fiber({
+                    while(true) {
+                        status.track.elapsed += playChunk(device, *status.track);
+                        Fiber.yield();
+                    }
+                });
 
         status.state = State.play;
     }
 
     void next() {
-        if(status.current + 1 < queue.ptr + (queue.length * Track.sizeof))
-            play(status.current + 1);
-    }
-
-    void seek(int seconds, bool relative) {
-        if(relative) {
-            sf_seek(file, cast(int64_t) secondsToFrames(seconds, i), SEEK_CUR);
-        } else {
-            sf_seek(file, cast(int64_t) secondsToFrames(seconds, i), SEEK_SET);
-        }
+        if(status.current < queue.length - 1)
+            status.current++;
+        play(status.current);
     }
 
     Socket socket = new TcpSocket();
@@ -413,46 +602,49 @@ void main() {
                 c.dumpStruct!Stats(stats);
                 break;
             case "currentsong":
-                if(status.current)
-                    c.dumpStruct!Track(*status.current);
+                if(status.track)
+                    c.dumpStruct!TrackMeta(*status.track);
                 break;
 
                 // playback control
             case "play":
                 uint pos = 0;
                 if(command.length > 1)
-                    pos = to!uint(command[1]);
+                    pos = min(to!uint(command[1]), command.length - 1);
 
                 if(queue.length > 1)
-                    play(&queue[pos]);
+                    play(pos);
                 break;
 
             case "seek":
-                uint songpos = to!uint(command[1]);
-                enforce(&queue[songpos] == status.current, "unsupported: seeking a song that's not the current one");
-                seek(to!int(command[1]), false);
+                float songpos = to!float(command[1]);
+                enforce(songpos == status.current, "unsupported: seeking a song that's not the current one");
+                (*status.track).seek(songpos, SEEK_SET);
                 break;
 
             case "seekid":
+                enforce(command.length == 3);
                 uint songid = to!uint(command[1]);
-                enforce(status.current.id == songid, "unsupported: seeking a song that's not the current one");
-                seek(to!int(command[1]), false);
+                float pos = to!float(command[2]);
+                enforce(status.track.id == songid, "unsupported: seeking a song that's not the current one");
+                (*status.track).seek(pos, SEEK_SET);
                 break;
 
             case "seekcur":
-                seek(to!int(command[1]), command[1][0] == '-' || command[1][0] == '+');
+                (*status.track).seek(to!float(command[1]), (command[1][0] == '-' || command[1][0] == '+') ? SEEK_CUR : SEEK_SET);
                 break;
 
             case "playid":
-                foreach(track; queue) {
-                    if(track.id == to!uint(command[1])) {
-                        play(&track);
+                int id = to!uint(command[1]);
+                foreach(i, track; queue.enumerate()) {
+                    if(track.id == id) {
+                        play(cast(uint) i);
                         break;
                     }
                 }
                 break;
             case "stop":
-                play(&queue[0]);
+                play(0);
                 status.state = State.stop;
                 break;
 
@@ -460,7 +652,7 @@ void main() {
                 next();
                 break;
             case "previous":
-                if(status.current - 1 >= queue.ptr)
+                if(status.current - 1 >= 0)
                     play(status.current - 1);
                 break;
             case "pause":
@@ -486,20 +678,21 @@ void main() {
 
                 if(p.isDir) {
                     foreach(t; p.dirEntries(SpanMode.depth)) {
+                        if(t.isDir) continue;
                         writeln("adding", t);
                         try {
-                            queue.addToPlaylist(makeTrack(t));
+                            queue.addToPlaylist(openMeta(t));
                         } catch(Exception e) {
-                            writeln("failed to add song");
+                            writeln(format!"failed to add song: %s"(e.msg));
                         }
                     }
                 } else {
-                    queue.addToPlaylist(makeTrack(p));
+                    queue.addToPlaylist(openMeta(p));
                 }
 
                 break;
             case "playlistinfo":
-                queue.each!(a => c.dumpStruct!Track(a));
+                queue.each!(a => c.dumpStruct!TrackMeta(a));
                 break;
 
             case "shuffle":
@@ -514,7 +707,7 @@ void main() {
 
             // other
             case "plchanges":
-                queue.each!(a => c.dumpStruct!Track(a));
+                queue.each!(a => c.dumpStruct!TrackMeta(a));
                 break;
 
             case "outputs":
@@ -594,7 +787,6 @@ void main() {
     // main loop
     while(true) {
         if(status.state == State.play) {
-            enforce(status.current);
             player.call();
             if(player.state == Fiber.State.TERM)
                 next();
@@ -616,6 +808,4 @@ void main() {
         else
             receive(handlers[0], handlers[1]);
     }
-
-    ao_shutdown();
 }
