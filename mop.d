@@ -263,6 +263,7 @@ struct mpg123_frameinfo {
 };
 
 const enum MPG123_OK = 0;
+const enum MPG123_DONE = -12;
 
 struct MpegTrack {
     static extensions = [".mpeg", ".mp3"];
@@ -401,15 +402,17 @@ Track open(string path) {
     return r;
 }
 
-void close(Track t) {
+void close(ref Track *t) {
     final switch(t.type) {
         case Track.Type.MpegTrack:
             mpg123_close(t.mpeg.mh);
+            mpg123_delete(t.mpeg.mh);
             break;
         case Track.Type.SndfileTrack:
             sf_close(t.sndfile.sfile);
             break;
     }
+    t = null;
 }
 
 float seek(ref Track t, float seconds, int whence) {
@@ -422,8 +425,8 @@ float seek(ref Track t, float seconds, int whence) {
     }
 }
 
-// returns seconds played
-float playChunk(ao_device *device, Track t) {
+// returns is_done, seconds played
+Tuple!(bool, float) playChunk(ao_device *device, Track t) {
     char[] buf = new char[t.framesize * t.nframes];
     int frames;
     size_t bytesRead;
@@ -432,6 +435,9 @@ float playChunk(ao_device *device, Track t) {
         case Track.Type.MpegTrack:
             int err = mpg123_read(t.mpeg.mh, buf.ptr, buf.length, &bytesRead);
             frames = cast(int) (bytesRead / t.framesize / t.format.channels);
+            if(err == MPG123_DONE) {
+                return tuple(true, 0.0f);
+            }
             enforce(err == MPG123_OK, format!"failed to read mp3: got error code %d"(err));
             break;
         case Track.Type.SndfileTrack:
@@ -442,15 +448,18 @@ float playChunk(ao_device *device, Track t) {
 
     float seconds = t.framesToSeconds(frames);
 
-    if(bytesRead == 0) return 0;
+    if(bytesRead == 0) {
+        return tuple(true, 0.0f);
+    }
 
     ao_play(device, buf.ptr, cast(uint) bytesRead);
-    return seconds;
+    return tuple(false, seconds);
 }
 
 TrackMeta openMeta(string path) {
     Track t = open(path);
-    scope(exit) t.close();
+    Track *tp = &t;
+    scope(exit) close(tp);
     return t.meta;
 }
 
@@ -540,29 +549,29 @@ void main() {
     void play(uint i) {
         status.current = i;
 
-        // cleanup previous track
-        {
+        // cleanup previous device
+        if(device) {
             if(status.track) {
-                status.track.destroy();
-                status.track = null;
+                close(status.track);
             }
 
-            if(device) {
-                ao_close(device);
-                device = null;
-            }
+            ao_close(device);
+            device = null;
         }
 
-        status.track = new Track;
-        *status.track = open(queue[i].file);
-
-        device = openDevice(queue[i], driver);
+        Track cur = open(queue[i].file);
+        status.track = &cur;
+        device = openDevice(cur, driver);
 
         if(player) player.destroy();
 
         player = new Fiber({
                     while(true) {
-                        status.track.elapsed += playChunk(device, *status.track);
+                        Tuple!(bool, float) r = playChunk(device, cur);
+                        bool isDone = r[0];
+                        if(isDone)
+                            return;
+                        cur.elapsed += r[1];
                         Fiber.yield();
                     }
                 });
@@ -787,9 +796,9 @@ void main() {
     // main loop
     while(true) {
         if(status.state == State.play) {
-            player.call();
             if(player.state == Fiber.State.TERM)
                 next();
+            player.call();
         }
 
         auto handlers = tuple((shared(Socket) c) => spawn(&listenToClient, c),
