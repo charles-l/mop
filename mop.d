@@ -19,6 +19,10 @@ import core.time;
 import std.random;
 import std.math;
 
+// config :P
+immutable string root = "/home/nc/mus/";
+immutable int port = 6601;
+
 //// FFI ////
 
 struct SNDFILE;
@@ -479,8 +483,6 @@ void sendError(Socket s, string msg, uint lineno = 0, Ack ack = Ack.ERROR_UNKNOW
     s.send(format!"ACK [%u@%u] {} %s\n"(ack, lineno, msg));
 }
 
-immutable string root = "/home/nc/mus/";
-
 void addToPlaylist(ref TrackMeta[] playlist, TrackMeta t) {
     t.id = cast(uint) playlist.length + 1;
     playlist ~= t;
@@ -587,7 +589,7 @@ void main() {
 
     Socket socket = new TcpSocket();
     socket.setOption(SocketOptionLevel.SOCKET, SocketOption.REUSEADDR, true);
-    socket.bind(new InternetAddress(6601));
+    socket.bind(new InternetAddress(port));
     socket.listen(5);
 
     Socket[] clients;
