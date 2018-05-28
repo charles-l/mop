@@ -617,14 +617,17 @@ void main() {
 
                 // playback control
             case "play":
-                uint pos = 0;
-                if(command.length > 1)
-                    pos = min(to!uint(command[1]), command.length - 1);
+                if(command.length > 1) {
+                    uint pos = min(to!uint(command[1]), command.length - 1);
+                    play(pos);
+                }
 
                 if(queue.length > 1)
-                    play(pos);
+                    if(status.state == State.stop)
+                        play(0);
+                    else if(status.state == State.pause)
+                        status.state = State.play;
                 break;
-
             case "seek":
                 float songpos = to!float(command[1]);
                 enforce(songpos == status.current, "unsupported: seeking a song that's not the current one");
